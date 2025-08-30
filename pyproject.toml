@@ -1,0 +1,18 @@
+[tool.poetry]
+name = "memo-chat-app-batch"
+version = "0.1.0"
+description = ""
+authors = ["yugo_fukuyama <tfscofield115@gmail.com>"]
+readme = "README.md"
+
+[tool.poetry.dependencies]
+python = "^3.11"
+psycopg2 = "^2.9.10"
+openai = "^1.12.0"
+python-dotenv = "^1.0.0"
+stripe = "^12.1.0"
+
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
