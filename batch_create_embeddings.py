@@ -8,6 +8,7 @@ import os
 import argparse
 from dotenv import load_dotenv
 from openai import AsyncOpenAI
+import google.generativeai as genai
 from utils import parse_db_url
 from tqdm.asyncio import tqdm
 
@@ -18,6 +19,15 @@ logger = logging.getLogger(__name__)
 logging.getLogger("openai").setLevel(logging.WARNING)
 logging.getLogger("httpx").setLevel(logging.WARNING)
 
+# Google gRPCのログレベルを調整してALTS警告を抑制
+logging.getLogger("google.auth").setLevel(logging.WARNING)
+logging.getLogger("google.api_core").setLevel(logging.WARNING)
+logging.getLogger("grpc").setLevel(logging.WARNING)
+
+# 環境変数でgRPCログレベルを設定（ALTS警告を抑制）
+os.environ.setdefault('GRPC_VERBOSITY', 'ERROR')
+os.environ.setdefault('GRPC_TRACE', '')
+
 load_dotenv()
 
 # テーブル名定数
@@ -26,6 +36,13 @@ IMAGE_EMBEDDINGS_TABLE = 'image_embeddings'
 
 # 直接接続URLを使用（pgbouncerなしの方が適切）
 DB_PARAMS = parse_db_url(os.getenv('DATABASE_URL'))
+
+# Gemini API設定
+def configure_gemini():
+    api_key = os.getenv("GOOGLE_API_KEY")
+    if not api_key:
+        raise ValueError("環境変数 'GOOGLE_API_KEY' が設定されていません。")
+    genai.configure(api_key=api_key)
 
 
 def truncate_text(text: str, max_chars: int = 2500) -> str:
@@ -45,20 +62,20 @@ def truncate_text(text: str, max_chars: int = 2500) -> str:
     # 区切り文字が見つからない場合はそのまま切る
     return truncated
 
-async def create_embedding(
+async def create_embedding_openai(
     text: str,
     embedding_dimensions: int = 512,
     max_retries: int = 3,
     max_chars: int = 2500
 ) -> Optional[List[float]]:
     client = AsyncOpenAI(api_key=os.getenv('OPENAI_API_KEY'))
-    
+
     # テキストの長さ制限
     original_length = len(text)
     text = truncate_text(text, max_chars)
     if original_length > max_chars:
         logger.warning(f"テキストを切り詰めました: {original_length}文字 → {len(text)}文字")
-    
+
     for retry_count in range(max_retries):
         try:
             response = await client.embeddings.create(
@@ -67,7 +84,7 @@ async def create_embedding(
                 dimensions=embedding_dimensions
             )
             embedding = response.data[0].embedding
-            
+
             # 次元数チェック
             if len(embedding) != embedding_dimensions:
                 logger.warning(f"次元数不一致: 期待値={embedding_dimensions}, 実際={len(embedding)} (リトライ {retry_count + 1}/{max_retries})")
@@ -77,24 +94,94 @@ async def create_embedding(
                 else:
                     logger.error(f"次元数不一致が続いたため失敗: 期待値={embedding_dimensions}, 実際={len(embedding)}")
                     return None
-            
+
             return embedding
-            
+
         except Exception as e:
-            logger.error(f"エンベディング生成エラー (リトライ {retry_count + 1}/{max_retries}): {e}")
+            logger.error(f"OpenAI エンベディング生成エラー (リトライ {retry_count + 1}/{max_retries}): {e}")
             if retry_count < max_retries - 1:
                 await asyncio.sleep(1)  # リトライ前に少し待機
             else:
                 logger.error(f"最大リトライ回数に達しました: {e}")
-    
+
     return None
+
+def create_embedding_gemini(
+    text: str,
+    embedding_dimensions: int = 768,
+    max_retries: int = 3,
+    max_chars: int = 2500
+) -> Optional[List[float]]:
+    try:
+        configure_gemini()
+    except ValueError as e:
+        logger.error(f"Gemini API設定エラー: {e}")
+        return None
+
+    # テキストの長さ制限
+    original_length = len(text)
+    text = truncate_text(text, max_chars)
+    if original_length > max_chars:
+        logger.warning(f"テキストを切り詰めました: {original_length}文字 → {len(text)}文字")
+
+    for retry_count in range(max_retries):
+        try:
+            result = genai.embed_content(
+                model="gemini-embedding-001",
+                content=text,
+                task_type="RETRIEVAL_DOCUMENT",
+                output_dimensionality=768,
+            )
+
+            embedding = result['embedding']
+
+            # Geminiのgemini-embedding-001は768次元を明示的に指定
+            if embedding_dimensions != 768:
+                logger.warning(f"Geminiは768次元で設定されています。指定された{embedding_dimensions}次元ではなく768次元を返します。")
+
+            return embedding
+
+        except Exception as e:
+            logger.error(f"Gemini エンベディング生成エラー (リトライ {retry_count + 1}/{max_retries}): {e}")
+            if retry_count < max_retries - 1:
+                time.sleep(1)  # リトライ前に少し待機（同期関数なのでsleep使用）
+            else:
+                logger.error(f"最大リトライ回数に達しました: {e}")
+
+    return None
+
+async def create_embedding(
+    text: str,
+    embedding_dimensions: int = 512,
+    max_retries: int = 3,
+    max_chars: int = 2500,
+    provider: str = "openai"
+) -> Optional[List[float]]:
+    if provider.lower() == "openai":
+        return await create_embedding_openai(text, embedding_dimensions, max_retries, max_chars)
+    elif provider.lower() == "gemini":
+        # Geminiは同期関数なので、asyncioで実行
+        import asyncio
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(
+            None,
+            create_embedding_gemini,
+            text,
+            embedding_dimensions,
+            max_retries,
+            max_chars
+        )
+    else:
+        logger.error(f"サポートされていないプロバイダー: {provider}")
+        return None
 
 async def process_memo_batch(
     memo_batch: List[Dict[str, Any]],
     conn,
     force_update: bool = False,
     embedding_dimensions: int = 512,
-    max_chars: int = 2500
+    max_chars: int = 2500,
+    provider: str = "openai"
 ) -> tuple[int, int]:
     cursor = conn.cursor()
     success_count = 0
@@ -107,9 +194,10 @@ async def process_memo_batch(
         
         combined_text = f"{title}\n{content}"
         embedding = await create_embedding(
-            combined_text, 
-            embedding_dimensions, 
-            max_chars=max_chars
+            combined_text,
+            embedding_dimensions,
+            max_chars=max_chars,
+            provider=provider
         )
         
         if not embedding:
@@ -171,7 +259,8 @@ async def process_memo_image_batch(
     conn,
     force_update: bool = False,
     embedding_dimensions: int = 512,
-    max_chars: int = 2500
+    max_chars: int = 2500,
+    provider: str = "openai"
 ) -> tuple[int, int]:
     cursor = conn.cursor()
     success_count = 0
@@ -185,9 +274,10 @@ async def process_memo_image_batch(
             continue
         
         embedding = await create_embedding(
-            description, 
-            embedding_dimensions, 
-            max_chars=max_chars
+            description,
+            embedding_dimensions,
+            max_chars=max_chars,
+            provider=provider
         )
         
         if not embedding:
@@ -309,7 +399,8 @@ async def fix_wrong_dimension_embeddings(
     target_dimensions: int,
     batch_size: int = 50,
     api_rate_limit_delay: float = 0.5,
-    max_chars: int = 2500
+    max_chars: int = 2500,
+    provider: str = "openai"
 ) -> None:
     """間違った次元数のエンベディングを正しい次元数で修正する"""
     try:
@@ -361,9 +452,10 @@ async def fix_wrong_dimension_embeddings(
                 logger.info(f"修正中: メモID={memo_id}, 現在の次元={current_dim} → {target_dimensions}")
                 
                 new_embedding = await create_embedding(
-                    combined_text, 
-                    target_dimensions, 
-                    max_chars=max_chars
+                    combined_text,
+                    target_dimensions,
+                    max_chars=max_chars,
+                    provider=provider
                 )
                 
                 if new_embedding:
@@ -412,9 +504,10 @@ async def fix_wrong_dimension_embeddings(
                 logger.info(f"修正中: 画像ID={image_id}, 現在の次元={current_dim} → {target_dimensions}")
                 
                 new_embedding = await create_embedding(
-                    description, 
-                    target_dimensions, 
-                    max_chars=max_chars
+                    description,
+                    target_dimensions,
+                    max_chars=max_chars,
+                    provider=provider
                 )
                 
                 if new_embedding:
@@ -461,7 +554,8 @@ async def batch_create_embeddings(
     api_rate_limit_delay: float = 0.5,
     embedding_dimensions: int = 512,
     force_update: bool = False,
-    max_chars: int = 2500
+    max_chars: int = 2500,
+    provider: str = "openai"
 ) -> None:
     try:
         conn = psycopg2.connect(**DB_PARAMS)
@@ -500,11 +594,12 @@ async def batch_create_embeddings(
                 batch = all_memos[i:i+batch_size]
                 
                 success, fail = await process_memo_batch(
-                    [dict(memo) for memo in batch], 
-                    conn, 
-                    force_update, 
-                    embedding_dimensions, 
-                    max_chars
+                    [dict(memo) for memo in batch],
+                    conn,
+                    force_update,
+                    embedding_dimensions,
+                    max_chars,
+                    provider
                 )
                 memo_success_total += success
                 memo_fail_total += fail
@@ -546,11 +641,12 @@ async def batch_create_embeddings(
                 batch = all_images[i:i+batch_size]
                 
                 success, fail = await process_memo_image_batch(
-                    [dict(image) for image in batch], 
-                    conn, 
-                    force_update, 
-                    embedding_dimensions, 
-                    max_chars
+                    [dict(image) for image in batch],
+                    conn,
+                    force_update,
+                    embedding_dimensions,
+                    max_chars,
+                    provider
                 )
                 image_success_total += success
                 image_fail_total += fail
@@ -583,15 +679,22 @@ def main():
     parser.add_argument('--force-update', action='store_true', help='既存のエンベディングを強制的に更新します')
     parser.add_argument('--fix-dimensions', action='store_true', help='間違った次元数のエンベディングを修正します')
     parser.add_argument('--max-chars', type=int, default=2500, help='エンベディング生成時のテキスト最大文字数 (デフォルト: 2500)')
+    parser.add_argument('--provider', type=str, default='gemini', choices=['openai', 'gemini'], help='エンベディングプロバイダー (デフォルト: gemini)')
     args = parser.parse_args()
     
+    # プロバイダーに応じて適切なデフォルト次元数を設定
+    if args.provider == "gemini" and args.embedding_dimensions == 512:
+        args.embedding_dimensions = 768
+        logger.info(f"Geminiプロバイダーのため、次元数を768に変更しました")
+
     if args.fix_dimensions:
-        logger.info(f"次元数修正モード: {args.embedding_dimensions}次元以外のエンベディングを修正します")
+        logger.info(f"次元数修正モード ({args.provider}): {args.embedding_dimensions}次元以外のエンベディングを修正します")
         asyncio.run(fix_wrong_dimension_embeddings(
             target_dimensions=args.embedding_dimensions,
             batch_size=args.batch_size,
             api_rate_limit_delay=args.api_rate_limit_delay,
-            max_chars=args.max_chars
+            max_chars=args.max_chars,
+            provider=args.provider
         ))
     else:
         if args.only_missing:
@@ -599,13 +702,15 @@ def main():
         if args.force_update:
             logger.info("Force update mode: 既存のエンベディングを強制的に更新します")
         
+        logger.info(f"エンベディングプロバイダー: {args.provider}")
         asyncio.run(batch_create_embeddings(
             only_missing=args.only_missing,
             batch_size=args.batch_size,
             api_rate_limit_delay=args.api_rate_limit_delay,
             embedding_dimensions=args.embedding_dimensions,
             force_update=args.force_update,
-            max_chars=args.max_chars
+            max_chars=args.max_chars,
+            provider=args.provider
         ))
 
 if __name__ == "__main__":
