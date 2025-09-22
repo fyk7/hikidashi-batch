@@ -32,9 +32,8 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Constants
-TARGET_CHUNK_SIZE = 700
-MIN_CHUNK_SIZE = 500
-OVERLAP_SIZE = 100
+TARGET_CHUNK_SIZE = 700  # 中心500文字 + 前後オーバーラップ分の余裕
+OVERLAP_SIZE = 100  # 前後のオーバーラップ
 EMBEDDING_MODEL_OPENAI = "text-embedding-3-small"
 EMBEDDING_MODEL_GEMINI = "gemini-embedding-001"
 BATCH_SIZE = 100
@@ -84,74 +83,157 @@ class MemoChunkProcessor:
         """Generate SHA-256 hash from text"""
         return hashlib.sha256(text.encode('utf-8')).hexdigest()
 
-    def recursive_split(self, text: str, final_chunks: List[str]) -> None:
-        """Recursively split long text by sentences"""
-        if len(text) <= TARGET_CHUNK_SIZE:
-            if text.strip():  # 空白のみでなければチャンクを生成
-                final_chunks.append(text)
-            return
+    def simple_chunk_split(self, text: str) -> List[str]:
+        """テキストを固定サイズのチャンクに分割する（シンプル版）"""
+        chunks = []
+        position = 0
 
-        # Split by sentence delimiters
-        sentence_pattern = r'(?<=[。\.！？\!?])\s+'
-        sentences = re.split(sentence_pattern, text)
+        logger.info(f"[SIMPLE_SPLIT] 入力テキスト長: {len(text)}文字")
 
-        current_chunk = ''
-        for sentence in sentences:
-            if len(current_chunk) + len(sentence) > TARGET_CHUNK_SIZE:
-                if len(current_chunk) > MIN_CHUNK_SIZE:
-                    final_chunks.append(current_chunk)
-                    current_chunk = sentence
-                else:
-                    current_chunk += sentence
-            else:
-                current_chunk += sentence
+        # 空文字またはトリムしても空の場合は空配列を返す
+        if not text or text.strip() == '':
+            logger.info("[SIMPLE_SPLIT] 空テキストのため分割なし")
+            return chunks
 
-        if current_chunk.strip():  # 空白のみでなければチャンクを生成
-            final_chunks.append(current_chunk)
+        # 短いテキストの場合はそのまま1つのチャンクとして返す
+        if len(text.strip()) <= TARGET_CHUNK_SIZE:
+            logger.info(f"[SIMPLE_SPLIT] 短いテキスト（{len(text.strip())}文字）のため1チャンクで返却")
+            chunks.append(text.strip())
+            logger.info(f"[SIMPLE_SPLIT] 分割結果: {len(chunks)}個のチャンク")
+            return chunks
+
+        while position < len(text):
+            # 残りが目標サイズ以下の場合は全て含める
+            if len(text) - position <= TARGET_CHUNK_SIZE:
+                chunk = text[position:]
+                logger.info(f"[SIMPLE_SPLIT] 最終チャンク: {len(chunk)}文字")
+                chunks.append(chunk)
+                break
+
+            # 目標サイズで切り出し
+            end_position = position + TARGET_CHUNK_SIZE
+
+            # 文の境界を探す（日本語・英語の句読点または改行）
+            search_start = max(position + TARGET_CHUNK_SIZE - 50, position)
+            search_end = min(position + TARGET_CHUNK_SIZE + 50, len(text))
+            search_text = text[search_start:search_end]
+
+            # 句読点または改行を探す（日本語と英語の両方に対応）
+            boundary_chars = ['。', '！', '？', '.', '!', '?', '\n']
+            last_boundary_pos = -1
+
+            for char in boundary_chars:
+                pos = search_text.rfind(char)
+                if pos > last_boundary_pos:
+                    last_boundary_pos = pos
+
+            if last_boundary_pos != -1:
+                end_position = search_start + last_boundary_pos + 1
+
+            chunk = text[position:end_position]
+            logger.info(f"[SIMPLE_SPLIT] チャンク[{len(chunks)}]: {len(chunk)}文字")
+            chunks.append(chunk)
+            position = end_position
+
+        logger.info(f"[SIMPLE_SPLIT] 分割結果: {len(chunks)}個のチャンク")
+        return chunks
+
+    def strip_html_tags(self, html_content: str) -> str:
+        """HTMLタグを除去してプレーンテキストを取得"""
+        soup = BeautifulSoup(html_content, 'lxml')
+        return soup.get_text(strip=True)
 
     def split_html_into_chunks(self, html_content: str) -> List[str]:
-        """Split HTML content into chunks with overlap"""
+        """HTMLコンテンツをチャンク分割し、オーバーラップを追加する"""
+        newline_char = '\\n'  # Define at function start for use in f-strings
+        logger.info(f"[CHUNK_SPLIT] HTMLコンテンツ長: {len(html_content)}文字")
+        logger.info(f"[CHUNK_SPLIT] HTMLコンテンツ内容: \"{html_content[:200].replace(chr(10), newline_char)}...\"")
+
         soup = BeautifulSoup(html_content, 'lxml')
 
-        # Remove noise elements
+        # 1. ノイズとなる要素を削除
         for tag in soup.find_all(['script', 'style', 'nav', 'footer']):
             tag.decompose()
 
-        # Primary split based on structure
+        # 2. 構造に基づいた一次分割
         initial_chunks = []
         block_tags = ['p', 'h1', 'h2', 'h3', 'h4', 'li', 'pre', 'blockquote']
+        seen_texts = set()  # 重複チェック用
 
         for tag_name in block_tags:
             for element in soup.find_all(tag_name):
                 text = element.get_text(strip=True)
-                if text:
+                if text and text not in seen_texts:  # 重複チェック追加
+                    logger.info(f"[CHUNK_SPLIT] 初期ブロック抽出[{len(initial_chunks)}]: \"{text[:100].replace(chr(10), newline_char)}...\" ({len(text)}文字)")
                     initial_chunks.append(text)
+                    seen_texts.add(text)
+                elif text and text in seen_texts:
+                    logger.warning(f"[CHUNK_SPLIT] 重複ブロックをスキップ: \"{text[:50].replace(chr(10), newline_char)}...\"")
 
-        # Secondary split based on character count
-        sized_chunks = []
-        for chunk in initial_chunks:
-            self.recursive_split(chunk, sized_chunks)
+        logger.info(f"[CHUNK_SPLIT] 初期ブロック数: {len(initial_chunks)}")
 
-        # HTMLからテキストが抽出できなかった場合、直接テキストを抽出して処理
-        if not sized_chunks:
-            text_content = soup.get_text(strip=True)
-            if text_content.strip():  # 空白のみでなければチャンクを生成
-                self.recursive_split(text_content, sized_chunks)
+        # 3. 全ブロックを結合してから分割
+        full_text = '\n\n'.join(initial_chunks)
 
-        # Add overlap
+        # ブロックが見つからない場合、HTMLタグを除去してプレーンテキストとして処理
+        if full_text.strip() == '' and html_content.strip() != '':
+            logger.info("[CHUNK_SPLIT] HTMLブロックが見つからないため、プレーンテキストとして処理")
+            full_text = self.strip_html_tags(html_content)
+            logger.info(f"[CHUNK_SPLIT] プレーンテキスト化後: {len(full_text)}文字")
+
+        logger.info(f"[CHUNK_SPLIT] 結合後の総文字数: {len(full_text)}文字")
+
+        # シンプルな固定サイズ分割を実行
+        sized_chunks = self.simple_chunk_split(full_text)
+
+        logger.info(f"[CHUNK_SPLIT] サイズ調整後チャンク数: {len(sized_chunks)}")
+
+        # 4. オーバーラップの追加
         if len(sized_chunks) <= 1:
+            logger.info(f"[CHUNK_SPLIT] オーバーラップなし(チャンク数 <= 1): {len(sized_chunks)}")
             return sized_chunks
 
-        final_chunks = [sized_chunks[0]]
+        final_chunks_with_overlap = [sized_chunks[0]]
+        logger.info(f"[CHUNK_SPLIT] オーバーラップ追加開始: {OVERLAP_SIZE}文字")
+
         for i in range(1, len(sized_chunks)):
             prev_chunk = sized_chunks[i - 1]
             current_chunk = sized_chunks[i]
 
-            # Add the last part of previous chunk to the beginning of current chunk
-            overlap = prev_chunk[-OVERLAP_SIZE:] if len(prev_chunk) > OVERLAP_SIZE else prev_chunk
-            final_chunks.append(overlap + "\n\n" + current_chunk)
+            # 前のチャンクの末尾を取得し、空白や改行でトリム
+            overlap = prev_chunk[-OVERLAP_SIZE:].strip()
 
-        return final_chunks
+            # 現在のチャンクが既に同じ内容で始まっているかチェック
+            current_start = current_chunk[:min(len(overlap) + 20, len(current_chunk))].strip()
+            if overlap in current_start or current_start[:30] in overlap:
+                logger.info(f"[CHUNK_SPLIT] チャンク[{i}]: オーバーラップ重複検出、スキップ")
+                final_chunks_with_overlap.append(current_chunk)
+            else:
+                chunk_with_overlap = overlap + "\n\n" + current_chunk
+                logger.info(f"[CHUNK_SPLIT] チャンク[{i}]: オーバーラップ長={len(overlap)}, 結果長={len(chunk_with_overlap)}")
+                logger.info(f"[CHUNK_SPLIT] チャンク[{i}]内容: \"{chunk_with_overlap[:150].replace(chr(10), newline_char)}...\"")
+                final_chunks_with_overlap.append(chunk_with_overlap)
+
+        logger.info(f"[CHUNK_SPLIT] 最終チャンク数: {len(final_chunks_with_overlap)}")
+
+        # 重複チェック
+        hash_set = set()
+        duplicates = []
+        for index, chunk in enumerate(final_chunks_with_overlap):
+            chunk_hash = self.generate_hash(chunk)
+            if chunk_hash in hash_set:
+                duplicates.append({'index': index, 'hash': chunk_hash[:8]})
+                logger.warning(f"[CHUNK_SPLIT] 重複チャンク検出: インデックス={index}, ハッシュ={chunk_hash[:8]}...")
+                logger.warning(f"[CHUNK_SPLIT] 重複内容: \"{chunk[:200].replace(chr(10), newline_char)}...\"")
+            else:
+                hash_set.add(chunk_hash)
+
+        if duplicates:
+            logger.warning(f"[CHUNK_SPLIT] 重複チャンク {len(duplicates)}個検出")
+        else:
+            logger.info("[CHUNK_SPLIT] 重複チャンクなし")
+
+        return final_chunks_with_overlap
 
     async def generate_embedding_openai(self, text: str) -> List[float]:
         """Generate embedding from text using OpenAI"""
@@ -208,22 +290,29 @@ class MemoChunkProcessor:
             cur.execute("""
                 SELECT m.id, m.title, m.content
                 FROM memos m
-                LEFT JOIN memo_chunks mc ON m.id = mc.memo_id AND mc.is_active = TRUE
+                LEFT JOIN memo_chunks mc ON m.id = mc.memo_id
                 WHERE m.is_deleted = FALSE
-                  AND m.is_draft = FALSE
+                  -- AND m.is_draft = FALSE
                   AND mc.id IS NULL
                 ORDER BY m.created_at DESC
-                LIMIT 100
             """)
             return cur.fetchall()
 
-    def deactivate_existing_chunks(self, conn, memo_id: str):
-        """Deactivate existing chunks"""
+    def delete_existing_chunks(self, conn, memo_id: str):
+        """Delete existing chunks for a memo"""
         with conn.cursor() as cur:
+            # First delete embeddings for the chunks
             cur.execute("""
-                UPDATE memo_chunks
-                SET is_active = FALSE, updated_at = NOW()
-                WHERE memo_id = %s AND is_active = TRUE
+                DELETE FROM chunk_embeddings
+                WHERE chunk_id IN (
+                    SELECT id FROM memo_chunks WHERE memo_id = %s
+                )
+            """, (memo_id,))
+
+            # Then delete the chunks themselves
+            cur.execute("""
+                DELETE FROM memo_chunks
+                WHERE memo_id = %s
             """, (memo_id,))
 
     def insert_chunks(self, conn, memo_id: str, chunks: List[str]) -> List[str]:
@@ -233,33 +322,17 @@ class MemoChunkProcessor:
             for i, chunk_text in enumerate(chunks):
                 text_hash = self.generate_hash(chunk_text)
 
-                # Check if chunk already exists
+                # Insert new chunk
                 cur.execute("""
-                    SELECT id FROM memo_chunks
-                    WHERE memo_id = %s AND text_hash = %s
-                """, (memo_id, text_hash))
-
-                existing = cur.fetchone()
-                if existing:
-                    # Reactivate existing chunk
-                    cur.execute("""
-                        UPDATE memo_chunks
-                        SET is_active = TRUE, chunk_index = %s, updated_at = NOW()
-                        WHERE id = %s
-                    """, (i, existing[0]))
-                    chunk_ids.append(existing[0])
-                else:
-                    # Insert new chunk
-                    cur.execute("""
-                        INSERT INTO memo_chunks (id, memo_id, chunk_text, text_hash, chunk_index, is_active, created_at, updated_at)
-                        VALUES (gen_random_uuid(), %s, %s, %s, %s, TRUE, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
-                        RETURNING id
-                    """, (memo_id, chunk_text, text_hash, i))
-                    chunk_ids.append(cur.fetchone()[0])
+                    INSERT INTO memo_chunks (id, memo_id, chunk_text, text_hash, chunk_index, created_at, updated_at)
+                    VALUES (gen_random_uuid(), %s, %s, %s, %s, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+                    RETURNING id
+                """, (memo_id, chunk_text, text_hash, i))
+                chunk_ids.append(cur.fetchone()[0])
 
         return chunk_ids
 
-    async def insert_embeddings(self, conn, chunk_ids: List[str], chunks: List[str], force_update: bool = True):
+    async def insert_embeddings(self, conn, chunk_ids: List[str], chunks: List[str], memo_title: str = "", force_update: bool = True):
         """Generate and save chunk embeddings"""
         embeddings_data = []
 
@@ -276,8 +349,12 @@ class MemoChunkProcessor:
                     if existing and not force_update:
                         continue  # Skip if embedding already exists and not forcing update
 
+                # メモのタイトルを先頭に付与してコンテキストを追加
+                text_with_context = f"{memo_title}\n\n{chunk_text}" if memo_title else chunk_text
+                logger.info(f"[EMBEDDING] チャンクID: {chunk_id} - テキスト長: {len(text_with_context)}文字 (タイトル{'含む' if memo_title else '含まず'})")
+
                 # Generate embedding
-                embedding = await self.generate_embedding(chunk_text)
+                embedding = await self.generate_embedding(text_with_context)
 
                 # 追加の次元数チェック（保険）
                 if len(embedding) != 768:
@@ -339,6 +416,7 @@ class MemoChunkProcessor:
         """Process a single memo"""
         memo_id = memo['id']
         content = memo['content']
+        title = memo.get('title', '')  # memoのtitleを取得
 
         try:
             # Split HTML content into chunks
@@ -348,14 +426,14 @@ class MemoChunkProcessor:
                 logger.warning(f"No chunks generated for memo {memo_id}")
                 return 0, 0
 
-            # Deactivate existing chunks
-            self.deactivate_existing_chunks(conn, memo_id)
+            # Delete existing chunks
+            self.delete_existing_chunks(conn, memo_id)
 
             # Insert new chunks
             chunk_ids = self.insert_chunks(conn, memo_id, chunks)
 
-            # Generate and save embeddings
-            await self.insert_embeddings(conn, chunk_ids, chunks, force_update)
+            # Generate and save embeddings with title context
+            await self.insert_embeddings(conn, chunk_ids, chunks, title, force_update)
 
             conn.commit()
 
@@ -383,9 +461,8 @@ class MemoChunkProcessor:
                             SELECT m.id, m.title, m.content
                             FROM memos m
                             WHERE m.is_deleted = FALSE
-                              AND m.is_draft = FALSE
+                              -- AND m.is_draft = FALSE
                             ORDER BY m.created_at DESC
-                            LIMIT 100
                         """)
                         memos = cur.fetchall()
                 else:
