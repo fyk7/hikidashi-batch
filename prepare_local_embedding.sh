@@ -9,7 +9,7 @@ set -e  # エラーが発生したら即座に終了
 export DATABASE_URL="postgresql://postgres:postgres@127.0.0.1:54322/postgres?schema=public"
 
 # 1. メモをチャンクに分割してエンベディングを生成
-python memo_to_chunk.py --only-missing
+uv run python memo_to_chunk.py --only-missing
 
 # 2. メモとメモ画像のエンベディングを一括生成
 python batch_create_embeddings.py --only-missing
